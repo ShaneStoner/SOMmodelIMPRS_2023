@@ -1,0 +1,658 @@
+---
+title: "Modeling Soil OM - IMPRS Course 2023"
+author: "Shane Stoner"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r load packages, include=FALSE}
+
+library(SoilR)
+library(FME)
+library(dplyr)
+
+```
+
+In this tutorial, we will use `SoilR` to model soil organic matter (SOM) dynamics. Specifically, we will fit SOM stocks and radiocarbon content to explore how "bomb" carbon (C) serves as a global tracer and allows us to model decadal dynamics. Later we will look at how some other famous soil C models are implemented in R, as well as temperature and moisture effects. 
+
+`SoilR` uses compartmental models, in varying configurations, to model the stochastic decay of SOM. These provide decay constants *k* for each pool, the inverse of which is a pool's "turnover time". However, this is not the most useful metric. The best descriptors of C dynamics are "transit time" and "system age", calculated as probability functions: how likely is C to decompose, or remain in the system?
+
+* Transit time: the time elapsed since a given C atom in the output flux entered the system
+* System age: the amount of time a given C atom has remained in the system
+
+The key differences between transit time and system age is that they refer to the output flux and the remaining SOM C, respectively. Thus, they can be very different depending on the dynamics between model pools.
+
+We will later explore transit time and system age distributions and the effects that management and changing decay rates play on SOM persistence.
+
+### Compartmental model structures
+
+There are three primary model structures that simulate different pathways of C movement between pools: series (transfer from faster to slower pools), parallel (no C transfer between pools), and feedback (C can move back and forth between pools, instead of in only one direction)
+
+<center><img src="`r "https://www.bgc-jena.mpg.de/TEE/assets/PoolModels.png"`"></center>
+
+`SoilR` has built-in functions for one, two, and three pool models. However, because the compartmental models are just differential equations calculated with matrices, many-pool models with specific transfer pathways can be easily constructed. 
+
+```{r Read in the data, echo = FALSE}
+
+setwd('/Users/shane/14Constraint Dropbox/Shane Stoner/IMPRS/Professional/Teaching')
+
+orgC = read.csv('WinchmoreOC.csv') # Carbon concentration data
+C14 = read.csv('Winchmore14C.csv') # Radiocarbon data
+# atm14C = read.csv('Atm14C.csv')
+
+bind.C14curves(prebomb=IntCal20, postbomb=Hua2021$NHZone2, time.scale="AD") %>% 
+  mutate(Year.AD = round(Year.AD)) %>% 
+  group_by(Year.AD) %>% 
+  summarize(Delta14C = mean(Delta14C)) %>% 
+  as.data.frame() -> atm14C # Atmospheric radiocarbon data, from -53000 AD (IntCal20) to 2019 (Hua et al., 2021)
+
+
+```
+
+Let's take a look at a two pool series model, where C can move from pool 1 (the "fast" pool) to pool 2 (the "slow" pool). For information on the other model structures, use the `?` command, e.g. `?ThreepFeedbackModel14`.
+
+```{r Try a 2 pool model}
+
+mod_years =  seq(1959, 2010)    # Years to model
+k1 = 0.2                        # Decay rate k of fast pool (pool 1)
+k2 = 0.015                      # Decay rate k of slow pool (pool 2)
+a_P1toP2 = 0.15                 # Proportion of C leaving pool 1 that is transferred to pool 2
+P1_C0 = 13                      # Mass C in pool 1 at beginning of model window
+P2_C0 = 11                      # Mass C in pool 2 at beginning of model window
+In = 2                          # Annual C inputs to system
+P1_C140 = 50                    # Initial radiocarbon content of pool 1 (in Delta 14C)
+P2_C140 = -100                  # Initial radiocarbon content of pool 2 (in Delta 14C)
+
+mod <- TwopSeriesModel14(
+  t = mod_years,                # Time
+  ks = c(k1, k2),               # Decay rates
+  C0 = c(P1_C0, P2_C0),         # Initial C stocks of pools
+  F0_Delta14C = c(P1_C140,      # Initial 14C of pools      
+                  P2_C140),
+  In = In,                      # Annual inputs (single value or data frame, if changes in inputs over time)
+  a21 = a_P1toP2 * k1,          # Proportion of pool 1 transferred to pool 2 annually, as a function of the total flux
+  lag = 1,                      # Lag time of inputs entering the soil. Can be greater for slower above ground decomposition or vertical transport
+  inputFc = atm14C              # Time series of atmospheric radiocarbon
+)
+
+mod_out = data.frame(getF14(mod),  # Pool D14C
+                     getF14C(mod), # System 14C
+                     getF14R(mod), # Respired 14C
+                     getC(mod),    # Pool C
+                     filter(atm14C, Year.AD %in% mod_years)) # Year and Atmosphere 14C)
+
+colnames(mod_out) <- c('P1 14C', 'P2 14C',
+                       'System 14C',
+                       'Resp. 14C',
+                       'P1 C', 'P2 C',
+                       'YearAD', 'Atm. 14C')
+
+```
+
+By applying the series of "get" functions to the model, we can estimate radiocarbon values for pool C, respired C, and total system C, as well as C stocks over time. Take a look at radiocarbon trends below. Try altering *k* values to see how it changes the system radiocarbon trend. 
+
+Note that respired C is always a mixture of C respired from all pools, and thus its mean value will always be between the 14C values of pools.
+
+
+```{r Plot toy model outputs, echo=FALSE}
+
+
+plot(mod_out$YearAD, mod_out$`P1 14C`, type = 'l', col = 'red3', lwd = 1.5,
+     ylim = c(min(select(mod_out, c('P1 14C', 'P2 14C', 'Atm. 14C'))), 
+              max(select(mod_out, c('P1 14C', 'P2 14C', 'Atm. 14C')))), xlab = "Year", ylab = "Delta 14C", main = "Soil Radiocarbon Dynamics")
+lines(mod_out$YearAD, mod_out$`P2 14C`, col = 'steelblue', lwd = 3)
+lines(mod_out$YearAD, mod_out$`System 14C`, col = 'purple3', lwd = 3)
+lines(mod_out$YearAD, mod_out$`Resp. 14C`, col = "green", lwd = 3)
+lines(atm14C, lwd = 2, col = 'green4')
+legend('topright', legend = c("Atmos.", "Fast Pool", "Slow Pool", "System", "Respired"),
+       col = c('green4', 'red3', 'steelblue', 'purple3', 'green'), lty = 1, lwd = 3)
+
+```
+
+We will now apply the model to some real data from a long-term agricultural research site in New Zealand. Sheep pasture production experiments were carried out for nearly 60 years, and the archived soils capture the bomb spike in atmospheric 14C. Very few datasets like this exist in the world; often we are modeling C dynamics with far fewer points. 
+
+(Schipper et al., 2013; Stoner et al., 2021)
+
+This uses the `modFit` function, which will attempt to optimize parameters to fit data. We can use C stocks as well as 14C to constrain the model, improving certainty. This can take a few seconds.
+
+```{r Fit model to data}
+
+arch_dat = data.frame('time' = orgC$time,
+                      'C_org' = (orgC$unfert / 100) * 0.075 * 10000 * 1.14, # For top 7.5 centimeters, with a bulk density of 1.14 g/cm3, in tonnes per hectare
+                      'C14' = C14$unfert)
+
+In = 2.2                        # Average annual inputs
+init_C = arch_dat$C_org[1]      # Get initial C stocks
+
+modFunc = function(pars){
+  mod = TwopSeriesModel14(
+    t = mod_years,
+    ks = c(pars[1], pars[2]),
+    a21 = pars[3] * pars[1],
+    C0 = c(init_C * pars[4], init_C * (1 - pars[4])),   # Here we add an extra variable that controls the distribution of initial C between two pools, as this is unknown
+    F0_Delta14C = c(P1_C140, P2_C140),
+    In = In,
+    lag = 1,
+    inputFc = atm14C
+  )
+   
+   C14_pools = getF14(mod)  # Pool D14C
+   C14_sys   = getF14C(mod) # System 14C
+   C14_resp  = getF14R(mod) # Respired 14C
+   C_sys     = getC(mod)    # Pool C
+   return(data.frame(time = mod_years, C14 = C14_sys, C_org = rowSums(C_sys)))
+}
+
+# A cost function is used to test model outputs against data to fit model parameters
+cost = function(pars){
+  modelOutput = modFunc(pars)
+  cost1 = modCost(model = modelOutput, obs = select(arch_dat, c('time', 'C_org')))
+  cost2 = modCost(model = modelOutput, obs = select(arch_dat, c('time', 'C14')), cost = cost1)
+  return(cost2)
+}
+
+# Initial model parameters
+init_pars = c(k1 = 0.1, k2 = 0.01, a21 = 0.3, poolsplit = 0.4)
+
+# The fitting procedure from package FME
+fit = modFit(f = cost,                    # Cost functions
+             p = init_pars,               # Initial parameters
+             upper = c(1, 0.5, 1, 1),     # Upper parameter limits (0 to 1 for all, except slow pool, which should not decay on shorter than 2 year timescale)
+             lower = c(0,   0, 0, 0))     # Lower parameter limits
+
+```
+
+```{r Apply fit to data, echo = FALSE}
+
+# Rebuild model with fit parameters
+fitmod = TwopSeriesModel14(
+  t = mod_years,
+  ks = c(fit$par[1], fit$par[2]),
+  a21 = c(fit$par[1] * fit$par[3]),
+  C0 = c(init_C * fit$par[4], init_C * (1 - fit$par[4])),
+  F0_Delta14C =  c(P1_C140, P2_C140),
+  In = In,
+  lag = 1,
+  inputFc = atm14C
+)
+
+fit_out = data.frame(getC14(fitmod),  # Pool 14C
+                     getF14(fitmod),  # Pool D14C
+                     getF14C(fitmod), # System 14C
+                     getF14R(fitmod), # Respired 14C
+                     getC(fitmod),    # Pool C
+                     filter(atm14C, Year.AD %in% mod_years)) # Year and Atmosphere 14C)
+
+colnames(fit_out) <- c('C14.1', 'C14.2',
+                       'P1 14C', 'P2 14C',
+                       'System 14C',
+                       'Resp. 14C',
+                       'P1 C', 'P2 C',
+                       'YearAD', 'Atm. 14C')
+
+
+print(paste("Fitted model parameters:"))
+print(round(fit$par, 5))
+print(paste("Pool turnover times (1 / k) in years:"))
+print(1 / fit$par[1:2])
+
+```
+
+Above we see the modeled decay rates for each pool, the transfer function *a21* (transfer from pool 1 to pool 2), and the proportional size of the fast pool (slow pool proportion = 1 - `poolsplit`). The inverse of the decay rates is the turnover time of the pools. Note that the fast pool is much, much faster than the slow pool.
+
+```{r Plot model outputs, echo = FALSE}
+
+# Plot data vs. modeled 14C
+plot(arch_dat$time, arch_dat$C14,
+          ylim = c(min(select(fit_out, c('P1 14C', 'P2 14C', 'Atm. 14C'))), 
+                   max(select(fit_out, c('P1 14C', 'P2 14C', 'Atm. 14C')))),
+          xlim = c(1955, 2010), 
+     cex = 1.3, col = 'dodgerblue4', pch = 23, lwd = 4, 
+     main = "Radiocarbon", xlab = "Year", ylab = "Delta 14C")
+lines(fit_out$YearAD, fit_out$`P1 14C`, col = 'red3', lwd = 3)
+lines(fit_out$YearAD, fit_out$`P2 14C`, col = 'steelblue3', lwd = 3)
+lines(fit_out$YearAD, fit_out$`System 14C`, col = 'purple4', lwd = 4)
+lines(fit_out$YearAD, fit_out$`Resp. 14C`, col = 'green', lwd = 2, lty = 2)
+lines(atm14C, col = 'green4', lwd = 3)
+legend('topright', legend = c("Data", "Atmos.", "Fast Pool", "Slow Pool", "System", "Respired"),
+       col = c("dodgerblue4",'green4', 'red3', 'steelblue', 'purple3', 'green'), lwd = 3,
+       pch = c(23, NA, NA, NA, NA,NA), lty = c(NA, 1, 1, 1, 1, 2))
+
+# Plot data vs. modeled C stocks
+plot(arch_dat$time, arch_dat$C_org,
+    ylim = c(min(select(fit_out, c('P1 C', 'P2 C',)), 0),
+               max(select(fit_out, c('P1 C', 'P2 C')), arch_dat$C_org)),
+    xlim = c(min(mod_years), max(mod_years)),
+    cex = 1.3, col = 'dodgerblue4', pch = 24, lwd = 4,
+    xlab = "Year", ylab = "C Stock (g m-2)", main = "Organic C")
+lines(fit_out$YearAD, fit_out$`P1 C`, col = 'red3', lwd = 3)
+lines(fit_out$YearAD, fit_out$`P2 C`, col = 'steelblue3', lwd = 3)
+lines(fit_out$YearAD, rowSums(data.frame(fit_out$`P1 C`, fit_out$`P2 C`)), col = 'purple4', lwd = 4)
+legend('bottomright', legend = c("Data",  "Fast Pool", "Slow Pool", "System"),
+       col = c("dodgerblue4", 'red3', 'steelblue', 'purple3'), lwd = 3,
+       pch = c(24, NA, NA, NA,NA), lty = c(NA, 1, 1, 1, 1))
+
+
+```
+
+Note that respired 14C (i.e. from laboratory incubations) can also be used as a model constraint. 
+
+However, much more descriptive metrics of C dynamics can be calculated from these modeled parameters. Transit time and system age are calculated from matrices, where decay rates are inverted on the diagonal, and transfer coefficients are located between pools. `transitTime` and `systemAge` are functions in the `SoilR` package.
+
+
+```{r Transit time and system age}
+
+# Ages and transit times of interest (years)
+a = seq(0, 500)
+
+### A matrix
+A = matrix(c(- fit$par[1], fit$par[1] * fit$par[3],
+             0,            - fit$par[2]),
+           nrow = 2, ncol = 2)
+
+### U matrix
+U = matrix(c(In,
+             0),
+           ncol = 1)
+
+TT = transitTime(A, U, a = a, q = c(0.25, 0.5, 0.75, 0.9))
+SA = systemAge(A, U,   a = a, q = c(0.25, 0.5, 0.75, 0.9))
+
+```
+
+```{r TT and SA facts and figures, echo=FALSE}
+
+# Plot transit time
+plot(a, TT$transitTimeDensity, type = 'l', xlab = "Transit time (yrs)", ylab = "Density", col = 'steelblue4', lwd = 4, xlim = c(0, 50), main = "Transit time distribution")
+abline(v = TT$quantiles, lty = 2, lwd = 3)
+legend("topright", legend = c("Transit time", "Quantile (25%, 50%, 75%, 95%)"), col = c('steelblue4', 1), lty = c(1,2))
+
+names(TT$quantiles) <- c("25%", "50%", "75%", "95%")
+print("Transit time statistics, in years")
+print(c(mean = TT$meanTransitTime, TT$quantiles))
+
+# Plot system age
+plot(a, SA$systemAgeDensity, type = 'l', xlab = "System age (yrs)", ylab = "Density", col = "brown4", lwd = 4, ylim = c(0, max(SA$systemAgeDensity)))
+abline(v = SA$quantilesSystemAge, lty = 2, lwd = 3)
+legend("topright", legend = c("System Age", "Quantile (25%, 50%, 75%, 95%)"), col = c('steelblue4', 1), lty = c(1,2))
+
+names(SA$quantiles) <- c("25%", "50%", "75%", "95%")
+print("System age statistics, in years")
+print(c(mean = SA$meanSystemAge, SA$quantiles))
+
+# Plot pool ages
+par(mfrow = c(1,2))
+plot(a, SA$poolAgeDensity[,1], type = 'l', col = 'brown1', lwd = 3, ylab = "Density", xlab = ("Pool C Age (yrs)"), main = "Pool 1", xlim = c(0, 30))
+plot(a, SA$poolAgeDensity[,2], type = 'l', col = 'brown2', lwd = 3, ylab = "Density", xlab = ("Pool C Age (yrs)"), main = "Pool 2")
+
+```
+
+## Comparison between treatments
+
+Now let's take a look at an experimental treatment, where large amounts of phosphorus fertilizer were applied, to see how additional nutrient availability. Notice that management also increased productivity (inputs are 3.1 T/ha in the fertilizer trial vs. 2.2 T/ha in unfertilized pasture).
+
+```{r Compare treatment effects}
+
+arch_dat = data.frame('time' = orgC$time,
+                      'C_org' = (orgC$highfert / 100) * 0.075 * 10000 * 1.14,
+                      'C14' = C14$highfert)
+
+In = 3.1
+
+```
+
+```{r High fert and comparison, echo=FALSE}
+
+init_C = arch_dat$C_org[1]
+
+modFunc = function(pars){
+  mod = TwopSeriesModel14(
+    t = mod_years,
+    ks = c(pars[1], pars[2]),
+    a21 = pars[3] * pars[1],
+    C0 = c(init_C * pars[4], init_C * (1 - pars[4])),
+    F0_Delta14C = c(P1_C140, P2_C140),
+    In = In,
+    lag = 1,
+    inputFc = atm14C
+  )
+   
+   C14_pools = getF14(mod)  # Pool D14C
+   C14_sys   = getF14C(mod) # System 14C
+   C14_resp  = getF14R(mod) # Respired 14C
+   C_sys     = getC(mod)    # Pool C
+   return(data.frame(time = mod_years, C14 = C14_sys, C_org = rowSums(C_sys)))
+}
+
+cost = function(pars){
+  modelOutput = modFunc(pars)
+  cost1 = modCost(model = modelOutput, obs = select(arch_dat, c('time', 'C_org')))
+  cost2 = modCost(model = modelOutput, obs = select(arch_dat, c('time', 'C14')), cost = cost1)
+  return(cost2)
+}
+
+init_pars = c(k1 = 0.1, k2 = 0.01, a21 = 0.15, poolsplit = 0.5)
+
+fit_fert = modFit(f = cost,
+             p = init_pars,
+             upper = c(1, 0.5, 1, 1),
+             lower = c(0,   0, 0, 0))
+
+# Ages and transit times of interest (years)
+a = seq(0, 500)
+
+### A matrix
+A_fert = matrix(c(- fit_fert$par[1], fit_fert$par[1] * fit_fert$par[3],
+             0,            - fit_fert$par[2]),
+           nrow = 2, ncol = 2)
+
+### U matrix
+U_fert = matrix(c(In,
+                  0),
+           ncol = 1)
+
+TT_fert = transitTime(A_fert, U_fert, a = a, q = c(0.25, 0.5, 0.75, 0.9))
+SA_fert = systemAge(A_fert, U_fert, a = a, q = c(0.25, 0.5, 0.75, 0.9))
+
+names(TT$quantiles) <- c("25%", "50%", "75%", "95%")
+print("Unfertilized transit time statistics, in years")
+print(c(mean = TT$meanTransitTime, TT$quantiles))
+
+names(SA$quantiles) <- c("25%", "50%", "75%", "95%")
+print("Unfertilized system age statistics, in years")
+print(c(mean = SA$meanSystemAge, SA$quantiles))
+
+names(TT_fert$quantiles) <- c("25%", "50%", "75%", "95%")
+print("Fertilized transit time statistics, in years")
+print(c(mean = round(TT_fert$meanTransitTime, 3), TT_fert$quantiles))
+
+names(SA_fert$quantiles) <- c("25%", "50%", "75%", "95%")
+print("Fertilized system age statistics, in years")
+print(c(mean = round(SA_fert$meanSystemAge, 3), SA_fert$quantiles))
+
+# Transit time comparison
+plot(a, TT$transitTimeDensity, type = 'l', xlab = "Transit time (yrs)", ylab = "Density", col = 'steelblue4', lwd = 4, xlim = c(0, 90), 
+     ylim = c(0, max(TT$transitTimeDensity, TT_fert$transitTimeDensity)),
+     main = "Fertilized vs. Unfertilized Transit Time")
+abline(v = TT$quantiles[2], lty = 2, lwd = 3, col = 'steelblue3')
+lines(a, TT_fert$transitTimeDensity, col = "brown4", lwd = 3)
+abline(v = TT_fert$quantiles[2], lty = 2, lwd = 3, col = 'brown3')
+abline(v = TT_fert$meanTransitTime, lty = 3, lwd = 3, col = 'brown3')
+abline(v = TT$meanTransitTime, lty = 3, lwd = 3, col = 'steelblue3')
+legend("topright", legend = c("Unfert.", "High Fert.", "Median TT", "Mean TT"), col = c("steelblue4", "brown4", 1, 1), lty = c(1,1,2,3), lwd = 3)
+
+
+```
+
+In these pasture soils, increased inputs and nutrient availability only increased decomposition, but did not lead to any greater C storage. Even with the large differences in system age, 50% of C leaving each system is 4 years or younger. In both cases, the models predict that all of the C gain over time is in the slow pool, and with lower inputs, the slow pool must be older in the unfertilized trials (Stoner et al., 2021).
+
+### Parameter optimization
+
+Here we will try a Bayesian parameter optimization. This is critical to calculating certainty values for parameters, which can in turn be used to calculate certainty for TT and SA. Generally, 10 000 iterations (argument `niter`) is the standard number for statistical reproducibility, but this takes a *long* time. 
+
+```{r Parameter optimization procedure}
+
+bayes_fit <- modMCMC(f = cost, p = fit$par, niter = 2000, burninlength = 1000,
+                     var0 = fit$var_ms_unweighted,
+                     upper = c(1,1,1,1),
+                     lower = c(0,0,0,0))
+
+plot(bayes_fit)
+pairs(bayes_fit)
+print(summary(bayes_fit))
+```
+
+## Radiocarbon distributions
+
+Radiocarbon measurements can be quite expensive (a major benefit of our institute: there is an accelerator mass spectrometer (AMS) in the basement), so they are not commmonly done on many fractions. Each 14C measurement is a mixture of all SOM. As we see from the previous example, C ages can range from months to millenia. 
+
+Thanks to new work (Chanca et al., 2022), we can now estimate the radiocarbon contents of an entire system as a function of the decay. By assuming decay as a stochastic process, some C will decay more quickly than other C, thus leaving behind a range of 14C contents. The calculation is below.
+
+```{r C14 distributions, echo = FALSE}
+
+### Year of observation?
+yr_obs = 1980
+
+### Age System RDC distributions
+SystemRDC <- function(A,
+                      u,
+                      nyears,
+                      yrobs,
+                      C14atm,
+                      C14YearAD,
+                      h = 0.1) {
+  year.ad <- seq(yrobs, (yrobs - nyears), by = -h)
+  age <- seq((yrobs - yrobs), nyears, by = h)
+  xss <- -1 * solve(A) %*% u
+  SAMD <- sum(xss) * (systemAge(A, u, a = age)$systemAgeDensity) #system age mass density
+  splineC14curve <- splinefun(x = C14YearAD, y = C14atm)
+  newResC14curve <- splineC14curve(year.ad)
+  D14C.decay <- ((((newResC14curve / 1000) + 1) * exp((-1 / 8267) * age)) - 1) * 1000
+  return(data.frame(YearAD = year.ad,
+                    D14C = D14C.decay,
+                    Mass = SAMD * h))
+}
+
+### Histogram bins
+C14hist <- function(D14C,
+                    Mass,
+                    interval) {
+  massdf <- data.frame(M = Mass,
+                       C14class = cut(D14C, breaks = interval),
+                       labels = FALSE)
+  aggMass <- aggregate(M ~ C14class,
+                       massdf,
+                       FUN = sum,
+                       drop = FALSE)
+  mid <- (diff(interval) / 2) + interval[-length(interval)]
+  return(list(aggMass, mid))
+}
+  
+Sys <- SystemRDC(A, U, 1000, yr_obs, atm14C$Delta14C, atm14C$Year.AD)
+
+Syshist <- C14hist(
+    D14C = Sys$D14C,
+    Mass = Sys$Mass / sum(Sys$Mass, na.rm=TRUE),
+    interval = 50
+  )
+
+Syshist <- data.frame(lower14C = seq(min(Sys$D14C), max(Sys$D14C), by = 19)[1:50],
+                      upper14C = seq(min(Sys$D14C), max(Sys$D14C), by = 19)[2:51],
+                      Mass  = Syshist[[1]]$M)
+
+Syshist <- Syshist %>% replace(is.na(.), 0)
+
+plot(Syshist$lower14C, Syshist$Mass, type = 'l', col = 0, xlab = "Delta 14C", ylab = "Density", main = paste("Distribution of 14C in", yr_obs))
+rect(xleft = Syshist$lower14C, xright = Syshist$upper14C, ytop = Syshist$Mass, ybottom = 0, lwd = 2)
+abline(v = weighted.mean(Syshist$upper14C, Syshist$Mass, na.rm = TRUE), lwd = 3, col = 'red4')
+
+```
+
+We can start to estimate 14C distributions from laboratory measurements as well, increasing the potential constraining power on SOM models, and requiring a fewer number of total samples (Stoner et al., 2023).
+
+## Other soil C models
+
+There exists an ever-growing set of C models, with varying levels of complexity. We have seen how `SoilR` uses compartmental models to simplify and integrate all environmental and soil characteristics into using only C dynamics to constrain a fewer number of parameters. Other more complext models take into account soil texture, temperature, moisture levels, SOM chemistry etc. Below we will take a brief look at some of them. 
+
+### Century model
+
+Century is one of the classics. It contains 7 pools, inputs are explicitly split between above and below ground, silt and clay contents and input lignin and nitrogen content are considered to estimate C cycling rates. It is resolved on weekly timescales and can incorporate 14C constraints. 
+
+```{r Century Model example}
+
+#### Carbon model
+
+mnths=seq(0,80)
+APPT=50 # Assume 50 cm annual precipitation
+Pmax=-40+7.7*APPT # Max aboveground production
+Rmax=100+7.0*APPT # Max belowground production
+abvgIn=Pmax/(Pmax+Rmax)
+blgIn=Rmax/(Pmax+Rmax)
+
+cm=CenturyModel(t=mnths, surfaceIn = abvgIn, soilIn = blgIn, LN=0.5, Ls=0.1)
+Ct=getC(cm)
+
+poolNames=c("Surface structural", "Surface metabolic", "Belowground structural",
+               "Belowground metabolic", "Active SOM", "Slow SOM", "Passive SOM")
+matplot(mnths,Ct, type="l", lty=1, col=1:7, xlab="Time (months)", ylab="Carbon stock ")
+legend("topleft", poolNames, lty=1, col=1:7, bty="n")
+
+#### Radiocarbon model
+
+cal_yrs=seq(1900,2015, by=1/12)
+APPT=50 # Assume 50 cm annual precipitation
+Pmax=-40+7.7*APPT # Max aboveground production
+Rmax=100+7.0*APPT # Max belowground production
+abvgIn=52*Pmax/(Pmax+Rmax)
+blgIn=52*Rmax/(Pmax+Rmax)
+AtmC14=Graven2017[,c("Year.AD", "NH")]
+
+cm=CenturyModel14(t=cal_yrs, surfaceIn = abvgIn, soilIn = blgIn, 
+                  F0_Delta14C=rep(0,7), inputFc=AtmC14, LN=0.5, Ls=0.1)
+C14t=getF14(cm)
+
+poolNames=c("Surface structural", "Surface metabolic", "Belowground structural",
+               "Belowground metabolic", "Active SOM", "Slow SOM", "Passive SOM")
+plot(AtmC14, type="l", ylab="Delta 14C (per mil)")
+matlines(cal_yrs,C14t, lty=1, col=2:8)
+legend("topleft", poolNames, lty=1, col=2:8, bty="n")
+
+```
+
+### RothC Model
+
+Short for "Rothamstad", this model was developed based on the Rothamstad Research station in England, which is home to the longest-running continuous crop experiments in the world. This model also utilizes the (in)famous "passive" C pool, a proportion of the C pool that in theory does not cycle on relevant time scales. In addition, there is a scalar for the proportion of decomposible plant inputs vs. resistant plant inputs (i.e. recalictrant). Both of these concepts are much debated.
+
+RothC uses 5 pools, can utilize an input of farm yard manure (FYM) as fertilizer, and accounts for clay content. The role of clay and other minerals in SOM persistence is a topic of active research. 
+
+```{r RothC model example, echo = FALSE}
+
+t=0:500 
+Ex=RothCModel(t)
+Ct=getC(Ex)
+Rt=getReleaseFlux(Ex)
+
+matplot(t,Ct,type="l",col=1:5, ylim=c(0,25),
+ylab=expression(paste("Carbon stores (Mg C ", ha^-1,")")),
+xlab="Time (years)", lty=1)
+lines(t,rowSums(Ct),lwd=2)
+legend("topleft",
+c("Pool 1, DPM",
+"Pool 2, RPM",
+"Pool 3, BIO",
+"Pool 4, HUM",
+"Pool 5, IOM",
+"Total Carbon"),
+lty=1,
+lwd=c(rep(1,5),2),
+col=c(1:5,1),
+bty="n"
+)
+
+```
+
+### A few other models
+
+* [Millenial Model](https://link.springer.com/article/10.1007/s10533-017-0409-7): Adapted CENTURY model with focus on modelling measureable vs. conceptual pools (Abramoff et al., 2018)
+
+* [COMISSION Model](https://www.sciencedirect.com/science/article/abs/pii/S0038071715002138): Vertically-resolved, microbially explicit model that fits vertical distributions of soil characteristics, SOM, and 14C (Ahrens et al., 2015.
+
+* Earth System Models (ESMs) represent soils and SOM in a wide variety of approaches.
+
+Remember: there is no "right" model, only ones that address the specific question you are asking.
+
+### Temperature and moisture controls on decomposition 
+
+In addition to the Arrhenius equation, there are many models that estimate how SOM decomposition will change with changing temperatures and moisture content. Some estimate a consistent increase in decomposition, while others estimate a maximum rate that decreases with extreme temperatures and high soil moisture that may limit oxygen availability, or low moisture that limits microbial activity. 
+
+```{r functions controlling C decomposition, echo = FALSE}
+
+data.frame(tempC = seq(-10, 45)) %>% 
+  #mutate(Arr.Decomp = fT.Arrhenius(tempC - 273.15)) %>% data.frame() %>%
+  mutate(Century = fT.Century1(tempC)) %>% 
+  mutate(Daycent = fT.Daycent1(tempC)) %>% 
+  mutate(Demeter = fT.Demeter(tempC)) %>% 
+  mutate(Linear = fT.linear(tempC)) %>% 
+  mutate(Kirschbaum = fT.KB(tempC)) %>% 
+  mutate(RothC = fT.RothC(tempC)) -> temp.decomp
+
+matplot(temp.decomp[,1], temp.decomp[,2:7], col = 2:8, type = 'l', lty = 1, lwd = 2, xlab = "Temp. (C)", ylab = "Decomp. Rate Scaler", main = "Temperature Effects on Decomposition")
+legend("topleft", c("Century", "Daycent", "Demeter", "Linear", "Kirschbaum", "RothC"), lty = 1, col = 2:8, lwd = 3)
+
+data.frame(swc = seq(0, 1, by = 0.02)) %>% 
+  mutate(Demeter = fW.Demeter(swc * 100)) %>% 
+  mutate(Moyano = fW.Moyano(swc)) %>% 
+  mutate(Skopp = fW.Skopp(swc)) %>% 
+  mutate(Gompertz = fW.Gompertz(swc)) -> swc.decomp
+
+matplot(swc.decomp[,1], swc.decomp[,2:5], type = 'l', lty = 1, lwd = 2, col = 2:6, main = "Soil Moisture Effects on Decomposition", xlab = "Soil Water Content", ylab = "Scaled Decomposition Rate")
+legend("bottom", c("Demeter", "Moyano", "Skopp", "Gompertz"), lty = 1, lwd = 2, col = 2:6)
+
+
+```
+
+### More microbially explicit models
+
+The models in `SoilR` are generalized and can be applied to many scenarios. Below is an implementation of the Bacwave model (Zelenev et al., 2000). These have specific use cases, which we won't get into in this course. 
+
+```{r Bacwave Model}
+
+hours=seq(0,800,0.1)
+#
+#Run the model with default parameter values
+bcmodel=bacwaveModel(t=hours)
+Cpools=getC(bcmodel)
+#
+#Time solution
+matplot(hours,Cpools,type="l",ylab="Concentrations",xlab="Hours",lty=1,ylim=c(0,max(Cpools)*1.2))
+legend("topleft",c("Substrate", "Microbial biomass"),lty=1,col=c(1,2),bty="n")
+#
+#State-space diagram
+plot(Cpools[,2],Cpools[,1],type="l",ylab="Substrate",xlab="Microbial biomass")
+#
+#Microbial biomass over time
+plot(hours,Cpools[,2],type="l",col=2,xlab="Hours",ylab="Microbial biomass")
+
+```
+
+
+## References
+
+Abramoff, R., Xu, X., Hartman, M., O'Brien, S., Feng, W., Davidson, E., Finzi, A., Moorhead, D., Schimel, J., Torn, M., & Mayes, M. A. (2018). The Millennial model: In search of measurable pools and transforma- tions for modeling soil carbon in the new century. Biogeochemistry, 137(1), 51–71. https://doi.org/10.1007/s1053 3-017-0409-7
+
+Adair, E. C., W. J. Parton, S. J. D. Grosso, W. L. Silver, M. E. Harmon, S. A. Hall, I. C. Burke, and S. C. Hart. 2008. Simple three-pool model accurately describes patterns of long-term litter decomposition in diverse climates. Global Change Biology 14:2636-2660.
+
+Ahrens, B., Braakhekke, M. C., Guggenberger, G., Schrumpf, M. & Reichstein, M. Contribution of sorption, DOC transport and microbial interactions to the 14C age of a soil organic carbon profile: Insights from a calibrated process model. Soil Biol. Biochem. 88, 390–402 (2015).
+
+Chanca I, Trumbore SE, Macario K, Sierra CA. 2022 Probability distributions of radiocarbon in open linear compartmental systems at steady-state. J. Geophys. Res. Biogeosci. 127, 1–23. (doi:10.1029/2021JG006673)
+
+Foley, J. A. (1995), An equilibrium model of the terrestrial carbon budget, Tellus B, 47(3), 310-319.
+
+I. Janssens, S. Dore, D. Epron, H. Lankreijer, N. Buchmann, B. Longdoz, J. Brossaud, L. Montagnani. 2003. Climatic Influences on Seasonal and Spatial Differences in Soil CO2 Efflux. In Valentini, R. (Ed.) Fluxes of Carbon, Water and Energy of European Forests. pp 235-253. Springer.
+
+Jenkinson, D. S., S. P. S. Andrew, J. M. Lynch, M. J. Goss, and P. B. Tinker. 1990. The Turnover of Organic Carbon and Nitrogen in Soil. Philosophical Transactions: Biological Sciences 329:361-368. 
+
+Kelly, R. H., W. J. Parton, M. D. Hartman, L. K. Stretch, D. S. Ojima, and D. S. Schimel (2000), Intra-annual and interannual variability of ecosystem processes in shortgrass steppe, J. Geophys. Res., 105.
+
+Kirschbaum, M. U. F. (1995), The temperature dependence of soil organic matter decomposition, and the effect of global warming on soil organic C storage, Soil Biology and Biochemistry, 27(6), 753-760.
+
+F. E. Moyano, S. Manzoni, C. Chenu. 2013 Responses of soil heterotrophic respiration to moisture availability: An exploration of processes and models. Soil Biology and Biochemistry, Volume 59, April 2013, Pages 72-85
+
+Parton, W.J, D.S. Schimel, C.V. Cole, and D.S. Ojima. 1987. Analysis of factors controlling soil organic matter levels in Great Plain grasslands. Soil Science Society of America Journal 51: 1173–1179. 
+
+Schuur EAG, Trumbore SE, Druffel ERM. 2016 Radiocarbon and Climate Change: Mechanisms, Applications and Laboratory Techniques. Cham, Switzerland: Springer.
+67.
+
+Sierra, C.A., M. Mueller, S.E. Trumbore. 2012. Models of soil organic matter decomposition: the SoilR package version 1.0. Geoscientific Model Development 5, 1045-1060.
+
+Sierra, C. A. (2012), Temperature sensitivity of organic matter decomposition in the Arrhenius equation: Some theoretical considerations, Biogeochemistry, 108(1), 1–15.
+
+Sierra CA, Müller M, Trumbore SE. 2014 Modeling radiocarbon dynamics in soils: SoilR version 1.1. Geosci. Model Dev. 7, 1919–1931. (doi:10.5194/gmd-7-1919-2014)
+
+Sierra, C.A., Hoyt, A.M., He, Y., Trumbore, S.E., 2018. Soil organic matter persistence as a stochastic process: age and transit time distributions of carbon in soils. Glob. Biogeochem. Cycle 32 (10), 1574–1588. https://doi.org/10.1029/2018gb005950.
+
+J. Skopp, M. D. Jawson, and J. W. Doran. 1990. Steady-state aerobic microbial activity as a function of soil water content. Soil Sci. Soc. Am. J., 54(6):1619-1625
+
+Stoner SW, Hoyt AM, Trumbore SE, Sierra CA, Schrumpf M, Doetterl S, Troy Baisden W, Schipper LA. 2021 Soil organic matter turnover rates increase to match increased inputs in grazed grasslands. Biogeochemistry 156, 145–160. (doi:10.1007/s10533-021-00838-z)
+
+Stoner SW, Schrumpf M, Hoyt A, Sierra CA, Doetterl S, Galy V, Trumbore SE. 2023 How well does ramped thermal oxidation quantify the age distribution of soil carbon? Assessing thermal stability of physically and chemically fractionated soil organic matter. Biogeosciences 20, 3151–3163. (doi:10.5194/bg-20-3151-2023)
